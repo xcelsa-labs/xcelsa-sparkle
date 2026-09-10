@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+#
+# rtl-equiv — agent-facing wrapper around Tools/RtlEquiv.lean
+#
+#   rtl-equiv <gold.v> <candidate.v> <out.lean>
+#
+# Proves the candidate RTL combinationally equivalent to the golden RTL,
+# per changed register/output cone, via bv_decide. Writes the generated
+# proof/counterexample reasoning to <out.lean>.
+#
+# Exit code IS the verdict (branch on this, do not scrape stdout):
+#   0  EQUIVALENT       — every changed cone proven equal
+#   1  NOT_EQUIVALENT   — bv_decide found a counterexample
+#   2  INCONCLUSIVE     — did not complete cleanly (timeout / sorry / lake error)
+#   3  UNSUPPORTED      — state/input signatures differ (retiming/pipeline/FSM re-encode)
+#   4  USAGE / IO error — bad args, missing file, parse/lower failure
+#
+set -euo pipefail
+
+if [ "$#" -ne 3 ]; then
+  echo "usage: rtl-equiv <gold.v> <candidate.v> <out.lean>" >&2
+  exit 4
+fi
+
+# elan (Lean toolchain) on PATH — the agent shouldn't have to set this up.
+export PATH="$HOME/.elan/bin:$PATH"
+
+# Repo root = parent of this script's dir (bin/). lake needs the lakefile
+# to resolve `import Sparkle.…`, so we run from there.
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Resolve the three args to ABSOLUTE paths BEFORE cd'ing — the caller's cwd
+# is not the repo root. Inputs must exist; the output path's parent must exist.
+if [ ! -f "$1" ]; then echo "rtl-equiv: gold file not found: $1" >&2; exit 4; fi
+if [ ! -f "$2" ]; then echo "rtl-equiv: candidate file not found: $2" >&2; exit 4; fi
+GOLD="$(readlink -f "$1")"
+CAND="$(readlink -f "$2")"
+OUT_DIR="$(cd "$(dirname "$3")" && pwd)" || { echo "rtl-equiv: output dir not found: $(dirname "$3")" >&2; exit 4; }
+OUT="$OUT_DIR/$(basename "$3")"
+
+cd "$REPO"
+exec lake env lean --run Tools/RtlEquiv.lean "$GOLD" "$CAND" "$OUT"
