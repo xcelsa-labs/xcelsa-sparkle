@@ -344,9 +344,12 @@ partial def lowerExpr (e : SVExpr) : Expr :=
     -- optimizer folds the indirection away.
     .slice (.concat [.const 0 w, lowerExpr arg]) (w - 1) 0
   | .unary .reductAnd arg =>
-    -- Reduction AND: &x → all bits set → (x XOR 0xFF...FF) == 0
-    -- Use XOR with -1 (all ones) for bitwise inversion, then compare with 0
-    .op .eq [.op .xor [lowerExpr arg, .const (-1) 32], .const 0 32]
+    -- Reduction AND: &x → all bits set → (x XOR all-ones) == 0, at the
+    -- OPERAND's width.  A hardcoded 32-bit mask leaves the high bits of a
+    -- narrower operand stuck at 1 (0 XOR 1), so a `&x[23:0]` could never be
+    -- true even when every bit is set (wrong in CSim/SMT/Verilog alike).
+    let w := (staticExprWidth arg).getD 32
+    .op .eq [.op .xor [lowerExpr arg, .const (-1) w], .const 0 w]
   | .unary .reductOr arg =>
     -- Reduction OR: |x → any bit set → x != 0
     .op .not [.op .eq [lowerExpr arg, .const 0 32]]
@@ -354,8 +357,13 @@ partial def lowerExpr (e : SVExpr) : Expr :=
     -- Logical NOT: !x → (x == 0) — reduces multi-bit to bool
     .op .eq [lowerExpr arg, .const 0 32]
   | .unary .bitNot arg =>
-    -- Bitwise NOT: ~x → XOR with all-ones (avoids confusion with logical NOT in IR)
-    .op .xor [lowerExpr arg, .const (-1) 32]
+    -- Bitwise NOT: ~x → XOR with all-ones at the OPERAND's width (avoids
+    -- confusion with logical NOT in IR).  A 32-bit mask over a narrower
+    -- operand sets phantom high bits that only cancel once the result is
+    -- masked to a consumer's width — but a full-width compare (`~x == y`)
+    -- or bv_decide sees them, so mask at `width(x)` when it is known.
+    let w := (staticExprWidth arg).getD 32
+    .op .xor [lowerExpr arg, .const (-1) w]
   | .unary .signed arg =>
     -- $signed(x): sign-extend concat immediates from their natural width to 32.
     -- For single wire refs (already 32-bit), pass through unchanged.

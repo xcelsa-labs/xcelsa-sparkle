@@ -137,6 +137,10 @@ inductive SVModuleItem where
                   (paramOverrides : List (String × SVExpr) := [])
   | taskDecl      (name : String) (body : List SVStmt)    -- task ... endtask
   | readmemh      (filename : String) (memName : String)  -- $readmemh("file", mem)
+  | portDecl      (dir : SVPortDir) (isReg : Bool)        -- non-ANSI body port decl:
+                  (width : Option (Nat × Nat)) (name : String)  -- `input [w] name;`.
+                  (widthExpr : Option (SVExpr × SVExpr)) (isSigned : Bool)
+                  -- Merged back into `SVModule.ports` by `parseModule`, then dropped.
   deriving Repr, BEq
 
 /-- A parsed Verilog module -/

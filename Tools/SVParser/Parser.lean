@@ -397,7 +397,16 @@ partial def parsePrimary : P SVExpr := do
         -- `'s` literals carry a signedness MARKER (`.unary .signed`) so a
         -- comparison against them lowers to the signed IR operator.
         pure (if sgn then SVExpr.unary .signed (SVExpr.lit lit) else SVExpr.lit lit)
-    else if isAlpha c' then let name ← identifier; pure (SVExpr.ident name)
+    else if isAlpha c' then
+      let name ← identifier
+      -- sv2v width-cast helper: `sv2v_cast_W(x)` is an identity resize; the
+      -- surrounding assign's LHS width performs the actual (zero-)extension,
+      -- so we return the argument unchanged.
+      if name.startsWith "sv2v_cast" then
+        match ← attempt lparen with
+        | some _ => let arg ← parseExpr; rparen; pure arg
+        | none => pure (SVExpr.ident name)
+      else pure (SVExpr.ident name)
     else fail s!"unexpected char in expression: '{c'}'"
   | none => fail "unexpected end of input in expression"
 
@@ -539,7 +548,33 @@ def parsePortInList : P SVPort := do
     Direction/reg/width persist until a new direction keyword appears. -/
 def parsePortList : P (List SVPort) := do
   lparen
-  let first ← parsePortInList
+  -- Non-ANSI (Verilog-1995 / sv2v) style: the header is a bare identifier
+  -- list `(a, b, c)`; directions and widths appear as body declarations.
+  -- Detect it by the first token NOT being a direction keyword. We emit
+  -- placeholder ports (dir/width backfilled from body `portDecl`s in
+  -- `parseModule`), preserving declaration order.
+  match ← attempt parsePortDir with
+  | none =>
+    let firstName ← identifier
+    let mut ports : List SVPort := [{ dir := .input, width := none, name := firstName }]
+    let mut cont := true
+    while cont do
+      match ← attempt comma with
+      | some _ => let n ← identifier; ports := ports ++ [{ dir := .input, width := none, name := n }]
+      | none => cont := false
+    rparen
+    return ports
+  | some firstDir =>
+  -- ANSI style: `firstDir` already consumed; finish the first port then
+  -- fall through to the existing direction/width carry-over loop.
+  let isReg0 ← match ← attempt (keyword "reg") with | some _ => pure true | none => pure false
+  let _ ← attempt (keyword "logic")
+  let _ ← attempt (keyword "wire")
+  let isSigned0 := match ← attempt (keyword "signed") with | some _ => true | none => false
+  let (width0, widthExpr0) ← parseOptWidthSym
+  let name0 ← identifier
+  let first : SVPort := { dir := firstDir, isReg := isReg0, width := width0,
+                          name := name0, widthExpr := widthExpr0, isSigned := isSigned0 }
   let mut ports := [first]
   let mut lastDir := first.dir
   let mut lastIsReg := first.isReg
@@ -708,6 +743,20 @@ partial def parseGenerateBranchItems : P (List SVModuleItem) := do
     Chained `else if` is represented by nesting: else-body contains another generateBlock. -/
 partial def parseGenerateBlock : P (List SVModuleItem) := do
   -- Already consumed "generate" keyword
+  -- `generate for (...) ... endgenerate`: skipped (module-level unrolling is
+  -- unsupported). Any output it drives becomes undriven and is omitted
+  -- downstream — fine when the block is identical across the compared RTLs.
+  match ← attempt (keyword "for") with
+  | some _ =>
+    let mut depth : Nat := 1   -- balance nested generate/endgenerate
+    while depth > 0 do
+      match ← attempt (keyword "endgenerate") with
+      | some _ => depth := depth - 1
+      | none => match ← attempt (keyword "generate") with
+        | some _ => depth := depth + 1
+        | none => let _ ← nextChar; pure ()
+    return []
+  | none => pure ()
   -- Expect: if (COND) begin ... end [else [if (COND) begin ... end]* [begin ... end]] endgenerate
   keyword "if"
   lparen; let cond ← parseExpr; rparen
@@ -732,6 +781,49 @@ partial def parseGenerateBlock : P (List SVModuleItem) := do
   pure [SVModuleItem.generateBlock cond ifItems elseItems]
 
 partial def parseModuleItems : P (List SVModuleItem) := do
+  -- Non-ANSI body port declaration: `input [reg] [wire/logic] [signed] [w] a, b;`.
+  -- Emitted as `portDecl` items and merged into the port list by `parseModule`.
+  match ← attempt parsePortDir with
+  | some dir =>
+    let isReg ← match ← attempt (keyword "reg") with | some _ => pure true | none => pure false
+    let _ ← attempt (keyword "logic")
+    let _ ← attempt (keyword "wire")
+    let isSigned := match ← attempt (keyword "signed") with | some _ => true | none => false
+    let (width, widthExpr) ← parseOptWidthSym
+    let n ← identifier
+    let mut items := [SVModuleItem.portDecl dir isReg width n widthExpr isSigned]
+    let mut cont := true
+    while cont do
+      match ← attempt comma with
+      | some _ => let n2 ← identifier
+                  items := items ++ [SVModuleItem.portDecl dir isReg width n2 widthExpr isSigned]
+      | none => cont := false
+    semi
+    return items
+  | none =>
+  -- `genvar i, j;` — declaration only; skipped (generate-for is skipped too).
+  match ← attempt (keyword "genvar") with
+  | some _ =>
+    let _ ← identifier
+    let mut cont := true
+    while cont do
+      match ← attempt comma with | some _ => let _ ← identifier; pure () | none => cont := false
+    semi
+    return []
+  | none =>
+  -- `function … endfunction` — skipped. sv2v cast helpers are the common case;
+  -- their call sites (`sv2v_cast_W(x)`) are handled as identity resizes in exprs.
+  match ← attempt (keyword "function") with
+  | some _ =>
+    let mut depth : Nat := 1
+    while depth > 0 do
+      match ← attempt (keyword "endfunction") with
+      | some _ => depth := depth - 1
+      | none => match ← attempt (keyword "function") with
+        | some _ => depth := depth + 1
+        | none => let _ ← nextChar; pure ()
+    return []
+  | none =>
   match ← attempt (keyword "assign") with
   | some _ =>
     let lhs ← parseExpr; eqSign; let rhs ← parseExpr; semi
@@ -971,6 +1063,17 @@ partial def parseModule : P SVModule := do
   let itemGroups ← many parseModuleItems
   let items := itemGroups.toList.flatMap id
   keyword "endmodule"
+  -- Non-ANSI backfill: override each header port with the dir/width/etc.
+  -- carried by its body `portDecl`, then drop the `portDecl` items. ANSI
+  -- modules have no `portDecl`s, so both steps are no-ops for them.
+  let portDecls : List (String × SVPort) := items.filterMap (fun it =>
+    match it with
+    | .portDecl dir isReg width name widthExpr isSigned =>
+        some (name, { dir, isReg, width, name, widthExpr, isSigned })
+    | _ => none)
+  let ports := if portDecls.isEmpty then ports else
+    ports.map (fun p => (portDecls.find? (·.1 == p.name)).map (·.2) |>.getD p)
+  let items := items.filter (fun it => match it with | .portDecl .. => false | _ => true)
   pure { name, params, ports, items }
 
 -- ============================================================================
